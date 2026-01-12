@@ -401,8 +401,17 @@ excelTranslate:
     title: エラー
     translationFailed: 翻訳処理に失敗しました
   fileLabel: Excelファイルを選択
+  progress:
+    cells: '翻訳済み: {{translated}} / {{total}} セル'
+    currentSheet: 'シート「{{sheet}}」を処理中'
+    processing: 処理中...
+    sheets: 'シート: {{processed}} / {{total}}'
   resetButton: リセット
   sourceLanguage: 翻訳元言語
+  status:
+    asyncNote: 大きなファイルの場合、処理に数分かかることがあります。このページを開いたままお待ちください。
+    pending: ジョブを開始しています...
+    processing: 翻訳処理中...
   success:
     cellsTranslated: '{{translated}} / {{total}} セルを翻訳しました'
     sheetsProcessed: '{{count}} シートを処理しました'

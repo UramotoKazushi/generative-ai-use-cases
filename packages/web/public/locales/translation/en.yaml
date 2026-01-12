@@ -463,8 +463,17 @@ excelTranslate:
     title: Error
     translationFailed: Translation failed
   fileLabel: Select Excel file
+  progress:
+    cells: 'Translated: {{translated}} / {{total}} cells'
+    currentSheet: 'Processing sheet "{{sheet}}"'
+    processing: Processing...
+    sheets: 'Sheets: {{processed}} / {{total}}'
   resetButton: Reset
   sourceLanguage: Source language
+  status:
+    asyncNote: Large files may take several minutes to process. Please keep this page open.
+    pending: Starting job...
+    processing: Processing translation...
   success:
     cellsTranslated: '{{translated}} / {{total}} cells translated'
     sheetsProcessed: '{{count}} sheets processed'

@@ -69,6 +69,7 @@ export interface BackendApiProps {
   readonly userPoolClient: UserPoolClient;
   readonly table: Table;
   readonly statsTable: Table;
+  readonly excelTranslationJobTable: Table;
   readonly knowledgeBaseId?: string;
   readonly agents?: string;
   readonly guardrailIdentify?: string;
@@ -825,7 +826,9 @@ export class Api extends Construct {
     table.grantReadData(getTokenUsageFunction);
     props.statsTable.grantReadData(getTokenUsageFunction);
 
-    // Lambda function for Excel translation (preserves formatting)
+    // Lambda function for Excel translation (async processing with DynamoDB)
+    const excelTranslationJobTable = props.excelTranslationJobTable;
+
     const translateExcelFunction = new DockerImageFunction(
       this,
       'TranslateExcel',
@@ -840,12 +843,14 @@ export class Api extends Construct {
           BUCKET_NAME: fileBucket.bucketName,
           MODEL_REGION: modelRegion,
           MODEL_ID: modelIds.length > 0 ? modelIds[0].modelId : '',
+          JOB_TABLE_NAME: excelTranslationJobTable.tableName,
         },
         vpc,
         securityGroups,
       }
     );
     fileBucket.grantReadWrite(translateExcelFunction);
+    excelTranslationJobTable.grantReadWriteData(translateExcelFunction);
     // Grant Bedrock permissions
     translateExcelFunction.role?.addToPrincipalPolicy(
       new PolicyStatement({
@@ -854,6 +859,42 @@ export class Api extends Construct {
         actions: ['bedrock:InvokeModel', 'bedrock:Converse'],
       })
     );
+
+    // Lambda function to start Excel translation job (returns immediately)
+    const startExcelTranslationFunction = new NodejsFunction(
+      this,
+      'StartExcelTranslation',
+      {
+        runtime: LAMBDA_RUNTIME_NODEJS,
+        entry: './lambda/startExcelTranslation.ts',
+        timeout: Duration.seconds(30),
+        environment: {
+          JOB_TABLE_NAME: excelTranslationJobTable.tableName,
+          TRANSLATE_FUNCTION_NAME: translateExcelFunction.functionName,
+        },
+        vpc,
+        securityGroups,
+      }
+    );
+    excelTranslationJobTable.grantReadWriteData(startExcelTranslationFunction);
+    translateExcelFunction.grantInvoke(startExcelTranslationFunction);
+
+    // Lambda function to get Excel translation job status
+    const getExcelTranslationStatusFunction = new NodejsFunction(
+      this,
+      'GetExcelTranslationStatus',
+      {
+        runtime: LAMBDA_RUNTIME_NODEJS,
+        entry: './lambda/getExcelTranslationStatus.ts',
+        timeout: Duration.seconds(30),
+        environment: {
+          JOB_TABLE_NAME: excelTranslationJobTable.tableName,
+        },
+        vpc,
+        securityGroups,
+      }
+    );
+    excelTranslationJobTable.grantReadData(getExcelTranslationStatusFunction);
 
     // API Gateway
     const authorizer = new CognitoUserPoolsAuthorizer(this, 'Authorizer', {
@@ -1138,12 +1179,20 @@ export class Api extends Construct {
       commonAuthorizerProps
     );
 
-    // POST: /excel/translate
+    // Excel translation API (async processing)
+    // POST: /excel/translate - Start translation job
+    // GET: /excel/translate/{jobId} - Get job status
     const excelResource = api.root.addResource('excel');
     const excelTranslateResource = excelResource.addResource('translate');
     excelTranslateResource.addMethod(
       'POST',
-      new LambdaIntegration(translateExcelFunction),
+      new LambdaIntegration(startExcelTranslationFunction),
+      commonAuthorizerProps
+    );
+    const excelJobResource = excelTranslateResource.addResource('{jobId}');
+    excelJobResource.addMethod(
+      'GET',
+      new LambdaIntegration(getExcelTranslationStatusFunction),
       commonAuthorizerProps
     );
 

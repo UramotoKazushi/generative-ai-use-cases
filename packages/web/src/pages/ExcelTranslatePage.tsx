@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useRef } from 'react';
+import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import Card from '../components/Card';
 import Button from '../components/Button';
@@ -22,15 +22,43 @@ const LANGUAGES = [
 ];
 /* eslint-enable i18nhelper/no-jp-string */
 
-type TranslationResult = {
-  outputS3Key: string;
-  downloadUrl: string;
-  stats: {
+type JobStatus = 'PENDING' | 'PROCESSING' | 'COMPLETED' | 'FAILED';
+
+type ProgressInfo = {
+  current_sheet?: string;
+  sheets_processed?: number;
+  total_sheets?: number;
+  translated_cells?: number;
+  total_translatable?: number;
+  percent?: number;
+  batch_progress?: string;
+};
+
+type JobStatusResponse = {
+  jobId: string;
+  status: JobStatus;
+  createdAt?: string;
+  startedAt?: string;
+  completedAt?: string;
+  failedAt?: string;
+  downloadUrl?: string;
+  outputS3Key?: string;
+  stats?: {
     total_cells: number;
     translated_cells: number;
     sheets_processed: number;
   };
+  progress?: ProgressInfo;
+  error?: string;
 };
+
+type StartJobResponse = {
+  jobId: string;
+  status: string;
+  message: string;
+};
+
+const POLLING_INTERVAL = 3000; // 3 seconds
 
 const ExcelTranslatePage: React.FC = () => {
   const { t } = useTranslation();
@@ -41,11 +69,64 @@ const ExcelTranslatePage: React.FC = () => {
   const [sourceLanguage, setSourceLanguage] = useState('Japanese');
   const [targetLanguage, setTargetLanguage] = useState('English');
   const [isUploading, setIsUploading] = useState(false);
-  const [isTranslating, setIsTranslating] = useState(false);
-  const [result, setResult] = useState<TranslationResult | null>(null);
+  const [jobId, setJobId] = useState<string | null>(null);
+  const [jobStatus, setJobStatus] = useState<JobStatus | null>(null);
+  const [progress, setProgress] = useState<ProgressInfo | null>(null);
+  const [result, setResult] = useState<JobStatusResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const pollingRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Cleanup polling on unmount
+  useEffect(() => {
+    return () => {
+      if (pollingRef.current) {
+        clearInterval(pollingRef.current);
+      }
+    };
+  }, []);
+
+  const pollJobStatus = useCallback(
+    async (id: string) => {
+      try {
+        // Use http.api.get directly (not http.get which uses SWR hook)
+        const response = await http.api.get<JobStatusResponse>(
+          `excel/translate/${id}`
+        );
+        const data = response.data;
+
+        if (!data) {
+          return;
+        }
+
+        setJobStatus(data.status);
+
+        // Update progress information
+        if (data.progress) {
+          setProgress(data.progress);
+        }
+
+        if (data.status === 'COMPLETED') {
+          setResult(data);
+          if (pollingRef.current) {
+            clearInterval(pollingRef.current);
+            pollingRef.current = null;
+          }
+        } else if (data.status === 'FAILED') {
+          setError(data.error || t('excelTranslate.error.translationFailed'));
+          if (pollingRef.current) {
+            clearInterval(pollingRef.current);
+            pollingRef.current = null;
+          }
+        }
+      } catch (err) {
+        console.error('Error polling job status:', err);
+        // Don't stop polling on transient errors
+      }
+    },
+    [http.api, t]
+  );
 
   const handleFileChange = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -63,6 +144,9 @@ const ExcelTranslatePage: React.FC = () => {
         setFile(selectedFile);
         setError(null);
         setResult(null);
+        setJobId(null);
+        setJobStatus(null);
+        setProgress(null);
       }
     },
     [t]
@@ -81,6 +165,9 @@ const ExcelTranslatePage: React.FC = () => {
 
     setError(null);
     setResult(null);
+    setJobId(null);
+    setJobStatus(null);
+    setProgress(null);
 
     try {
       // Step 1: Get signed URL and upload file
@@ -96,32 +183,47 @@ const ExcelTranslatePage: React.FC = () => {
       setIsUploading(false);
 
       // Step 2: Extract S3 key from signed URL
-      // URL format: https://bucket.s3.region.amazonaws.com/uuid/filename.xlsx?...
       const baseUrl = extractBaseURL(signedUrl);
       const urlObj = new URL(baseUrl);
-      // Remove leading slash from pathname to get S3 key
       const s3Key = urlObj.pathname.slice(1);
 
-      // Step 3: Call translation API
-      setIsTranslating(true);
-      const response = await http.post<TranslationResult>('excel/translate', {
+      // Step 3: Start translation job (async)
+      setJobStatus('PENDING');
+      const response = await http.post<StartJobResponse>('excel/translate', {
         s3Key,
         sourceLanguage,
         targetLanguage,
       });
 
-      setResult(response.data);
-      setIsTranslating(false);
+      const newJobId = response.data.jobId;
+      setJobId(newJobId);
+
+      // Step 4: Start polling for job status
+      pollingRef.current = setInterval(() => {
+        pollJobStatus(newJobId);
+      }, POLLING_INTERVAL);
+
+      // Also poll immediately
+      pollJobStatus(newJobId);
     } catch (err) {
       setIsUploading(false);
-      setIsTranslating(false);
+      setJobStatus(null);
       setError(
         err instanceof Error
           ? err.message
           : t('excelTranslate.error.translationFailed')
       );
     }
-  }, [file, sourceLanguage, targetLanguage, getSignedUrl, uploadFile, http, t]);
+  }, [
+    file,
+    sourceLanguage,
+    targetLanguage,
+    getSignedUrl,
+    uploadFile,
+    http,
+    t,
+    pollJobStatus,
+  ]);
 
   const handleDownload = useCallback(() => {
     if (result?.downloadUrl) {
@@ -130,15 +232,36 @@ const ExcelTranslatePage: React.FC = () => {
   }, [result]);
 
   const handleReset = useCallback(() => {
+    if (pollingRef.current) {
+      clearInterval(pollingRef.current);
+      pollingRef.current = null;
+    }
     setFile(null);
     setResult(null);
     setError(null);
+    setJobId(null);
+    setJobStatus(null);
+    setProgress(null);
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
   }, []);
 
-  const isProcessing = isUploading || isTranslating;
+  const isProcessing =
+    isUploading ||
+    (jobStatus !== null && !['COMPLETED', 'FAILED'].includes(jobStatus));
+
+  const getStatusMessage = () => {
+    if (isUploading) return t('excelTranslate.uploading');
+    switch (jobStatus) {
+      case 'PENDING':
+        return t('excelTranslate.status.pending');
+      case 'PROCESSING':
+        return t('excelTranslate.status.processing');
+      default:
+        return t('excelTranslate.translateButton');
+    }
+  };
 
   return (
     <div className="grid grid-cols-12">
@@ -218,6 +341,66 @@ const ExcelTranslatePage: React.FC = () => {
             </div>
           )}
 
+          {/* Processing Status */}
+          {isProcessing && jobId && (
+            <div className="mb-4 rounded-lg border border-blue-200 bg-blue-50 p-4">
+              <div className="flex items-center gap-2">
+                <PiSpinnerGap
+                  className="animate-spin text-blue-600"
+                  size={20}
+                />
+                <span className="text-blue-800">{getStatusMessage()}</span>
+              </div>
+
+              {/* Progress Bar */}
+              {progress && progress.percent !== undefined && (
+                <div className="mt-4">
+                  <div className="mb-2 flex justify-between text-sm text-blue-700">
+                    <span>
+                      {progress.current_sheet
+                        ? t('excelTranslate.progress.currentSheet', {
+                            sheet: progress.current_sheet,
+                          })
+                        : t('excelTranslate.progress.processing')}
+                    </span>
+                    {/* eslint-disable-next-line @shopify/jsx-no-hardcoded-content */}
+                    <span>{progress.percent}%</span>
+                  </div>
+                  <div className="h-3 w-full overflow-hidden rounded-full bg-blue-200">
+                    <div
+                      className="h-full rounded-full bg-blue-600 transition-all duration-300"
+                      style={{ width: `${progress.percent}%` }}
+                    />
+                  </div>
+                  <div className="mt-2 flex flex-wrap gap-4 text-xs text-blue-600">
+                    {progress.translated_cells !== undefined &&
+                      progress.total_translatable !== undefined && (
+                        <span>
+                          {t('excelTranslate.progress.cells', {
+                            translated: progress.translated_cells,
+                            total: progress.total_translatable,
+                          })}
+                        </span>
+                      )}
+                    {progress.sheets_processed !== undefined &&
+                      progress.total_sheets !== undefined && (
+                        <span>
+                          {t('excelTranslate.progress.sheets', {
+                            processed: progress.sheets_processed,
+                            total: progress.total_sheets,
+                          })}
+                        </span>
+                      )}
+                  </div>
+                </div>
+              )}
+
+              <p className="mt-3 text-sm text-blue-600">
+                {t('excelTranslate.status.asyncNote')}
+              </p>
+            </div>
+          )}
+
           {/* Action Buttons */}
           <div className="flex gap-4">
             <Button
@@ -227,11 +410,7 @@ const ExcelTranslatePage: React.FC = () => {
               {isProcessing && (
                 <PiSpinnerGap className="animate-spin" size={20} />
               )}
-              {isUploading
-                ? t('excelTranslate.uploading')
-                : isTranslating
-                  ? t('excelTranslate.translating')
-                  : t('excelTranslate.translateButton')}
+              {getStatusMessage()}
             </Button>
             <Button outlined onClick={handleReset} disabled={isProcessing}>
               {t('excelTranslate.resetButton')}
@@ -239,23 +418,27 @@ const ExcelTranslatePage: React.FC = () => {
           </div>
 
           {/* Result */}
-          {result && (
+          {result && result.status === 'COMPLETED' && (
             <div className="mt-6 rounded-lg border border-green-200 bg-green-50 p-4">
               <h3 className="mb-2 font-medium text-green-800">
                 {t('excelTranslate.success.title')}
               </h3>
               <div className="mb-4 text-sm text-green-700">
-                <p>
-                  {t('excelTranslate.success.sheetsProcessed', {
-                    count: result.stats.sheets_processed,
-                  })}
-                </p>
-                <p>
-                  {t('excelTranslate.success.cellsTranslated', {
-                    translated: result.stats.translated_cells,
-                    total: result.stats.total_cells,
-                  })}
-                </p>
+                {result.stats && (
+                  <>
+                    <p>
+                      {t('excelTranslate.success.sheetsProcessed', {
+                        count: result.stats.sheets_processed,
+                      })}
+                    </p>
+                    <p>
+                      {t('excelTranslate.success.cellsTranslated', {
+                        translated: result.stats.translated_cells,
+                        total: result.stats.total_cells,
+                      })}
+                    </p>
+                  </>
+                )}
               </div>
               <Button
                 onClick={handleDownload}
