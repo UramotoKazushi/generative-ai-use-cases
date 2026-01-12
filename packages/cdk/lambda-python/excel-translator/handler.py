@@ -3,10 +3,15 @@ Excel Translator Lambda Handler
 
 Translates Excel files while preserving all formatting (fonts, borders, colors, etc.)
 Supports async processing with DynamoDB job status tracking.
+Features:
+- Translation caching for duplicate text optimization
+- Smart cell filtering (skip numbers, URLs, emails, dates)
+- Support for both .xlsx and .xls formats
 """
 
 import json
 import os
+import re
 import time
 import uuid
 from datetime import datetime
@@ -19,7 +24,58 @@ from aws_lambda_powertools.utilities.typing import LambdaContext
 from openpyxl import load_workbook
 from openpyxl.cell.cell import Cell
 
+# For .xls support
+import xlrd
+from openpyxl import Workbook
+
 logger = Logger()
+
+# Translation cache to avoid duplicate API calls
+translation_cache: dict[str, str] = {}
+
+
+def convert_xls_to_xlsx(xls_path: str, xlsx_path: str) -> None:
+    """
+    Convert .xls file to .xlsx format.
+    Note: Some advanced formatting may not be preserved.
+    """
+    xls_book = xlrd.open_workbook(xls_path, formatting_info=False)
+    xlsx_book = Workbook()
+
+    # Remove default sheet
+    if "Sheet" in xlsx_book.sheetnames:
+        del xlsx_book["Sheet"]
+
+    for sheet_idx in range(xls_book.nsheets):
+        xls_sheet = xls_book.sheet_by_index(sheet_idx)
+        xlsx_sheet = xlsx_book.create_sheet(title=xls_sheet.name)
+
+        for row_idx in range(xls_sheet.nrows):
+            for col_idx in range(xls_sheet.ncols):
+                cell = xls_sheet.cell(row_idx, col_idx)
+                value = cell.value
+
+                # Handle different cell types
+                if cell.ctype == xlrd.XL_CELL_DATE:
+                    try:
+                        value = xlrd.xldate.xldate_as_datetime(cell.value, xls_book.datemode)
+                    except Exception:
+                        pass
+                elif cell.ctype == xlrd.XL_CELL_BOOLEAN:
+                    value = bool(cell.value)
+                elif cell.ctype == xlrd.XL_CELL_ERROR:
+                    value = None
+
+                xlsx_sheet.cell(row=row_idx + 1, column=col_idx + 1, value=value)
+
+    xlsx_book.save(xlsx_path)
+    logger.info(f"Converted .xls to .xlsx: {xls_path} -> {xlsx_path}")
+
+
+def is_xls_file(filename: str) -> bool:
+    """Check if file is .xls format (not .xlsx)"""
+    return filename.lower().endswith(".xls") and not filename.lower().endswith(".xlsx")
+
 
 s3_client = boto3.client("s3")
 dynamodb_client = boto3.client("dynamodb")
@@ -59,9 +115,15 @@ def update_job_status(job_id: str, status: str, **kwargs) -> None:
 
 
 def translate_text_with_retry(text: str, source_lang: str, target_lang: str, max_retries: int = 5) -> str:
-    """Translate text using Amazon Bedrock with exponential backoff"""
+    """Translate text using Amazon Bedrock with exponential backoff and caching"""
     if not text or not text.strip():
         return text
+
+    # Check cache first
+    cache_key = f"{source_lang}:{target_lang}:{text}"
+    if cache_key in translation_cache:
+        logger.debug(f"Cache hit for text: {text[:30]}...")
+        return translation_cache[cache_key]
 
     prompt = f"""Translate the following {source_lang} text to {target_lang}.
 Rules:
@@ -80,7 +142,10 @@ Text to translate:
                 messages=[{"role": "user", "content": [{"text": prompt}]}],
                 inferenceConfig={"maxTokens": 4096, "temperature": 0.1},
             )
-            return response["output"]["message"]["content"][0]["text"].strip()
+            translated = response["output"]["message"]["content"][0]["text"].strip()
+            # Store in cache
+            translation_cache[cache_key] = translated
+            return translated
         except ClientError as e:
             if e.response["Error"]["Code"] == "ThrottlingException":
                 if attempt < max_retries - 1:
@@ -100,7 +165,7 @@ Text to translate:
 
 def batch_translate_texts(texts: list[tuple[str, Any]], source_lang: str, target_lang: str, job_id: str = None, base_translated: int = 0, total_translatable: int = 0) -> dict[Any, str]:
     """
-    Batch translate multiple texts efficiently.
+    Batch translate multiple texts efficiently with caching.
     Returns a dict mapping original cell references to translated text.
     """
     # Filter out empty texts and non-string values
@@ -109,13 +174,30 @@ def batch_translate_texts(texts: list[tuple[str, Any]], source_lang: str, target
     if not translatable:
         return {}
 
+    translations = {}
+    texts_to_translate = []
+
+    # Check cache first and separate cached vs uncached texts
+    for ref, text in translatable:
+        cache_key = f"{source_lang}:{target_lang}:{text}"
+        if cache_key in translation_cache:
+            translations[ref] = translation_cache[cache_key]
+        else:
+            texts_to_translate.append((ref, text))
+
+    cache_hits = len(translations)
+    if cache_hits > 0:
+        logger.info(f"Cache hits: {cache_hits}/{len(translatable)} texts")
+
+    if not texts_to_translate:
+        return translations
+
     # Smaller batch size to avoid throttling
     BATCH_SIZE = 10
-    translations = {}
     max_retries = 5
 
-    for i in range(0, len(translatable), BATCH_SIZE):
-        batch = translatable[i : i + BATCH_SIZE]
+    for i in range(0, len(texts_to_translate), BATCH_SIZE):
+        batch = texts_to_translate[i : i + BATCH_SIZE]
 
         # Create a numbered list for batch translation
         numbered_texts = "\n".join([f"[{idx}] {text}" for idx, (ref, text) in enumerate(batch)])
@@ -149,8 +231,11 @@ Texts to translate:
                             idx = int(line[1:bracket_end])
                             translated = line[bracket_end + 1 :].strip()
                             if 0 <= idx < len(batch):
-                                ref, _ = batch[idx]
+                                ref, original_text = batch[idx]
                                 translations[ref] = translated
+                                # Store in cache
+                                cache_key = f"{source_lang}:{target_lang}:{original_text}"
+                                translation_cache[cache_key] = translated
                         except (ValueError, IndexError):
                             continue
 
@@ -210,6 +295,61 @@ Texts to translate:
     return translations
 
 
+def should_skip_text(text: str) -> bool:
+    """
+    Check if text should be skipped from translation.
+    Returns True if the text doesn't need translation.
+    """
+    text = text.strip()
+
+    # Empty or whitespace only
+    if not text:
+        return True
+
+    # Numbers only (including decimals, negatives, percentages)
+    if re.match(r'^-?[\d,]+\.?\d*%?$', text):
+        return True
+
+    # Date patterns (various formats)
+    date_patterns = [
+        r'^\d{4}[-/]\d{1,2}[-/]\d{1,2}$',  # 2024-01-15, 2024/01/15
+        r'^\d{1,2}[-/]\d{1,2}[-/]\d{4}$',  # 01-15-2024, 01/15/2024
+        r'^\d{1,2}[-/]\d{1,2}[-/]\d{2}$',  # 01-15-24, 01/15/24
+        r'^\d{4}年\d{1,2}月\d{1,2}日$',     # 2024年1月15日
+    ]
+    for pattern in date_patterns:
+        if re.match(pattern, text):
+            return True
+
+    # Time patterns
+    if re.match(r'^\d{1,2}:\d{2}(:\d{2})?(\s*[APap][Mm])?$', text):
+        return True
+
+    # URLs
+    if re.match(r'^https?://', text, re.IGNORECASE):
+        return True
+
+    # Email addresses
+    if re.match(r'^[\w\.-]+@[\w\.-]+\.\w+$', text):
+        return True
+
+    # Phone numbers (various formats)
+    if re.match(r'^[\d\s\-\+\(\)]+$', text) and len(re.sub(r'\D', '', text)) >= 7:
+        return True
+
+    # Single characters or symbols only
+    if len(text) <= 2 and not any(c.isalpha() for c in text):
+        return True
+
+    # Currency values
+    if re.match(r'^[$€£¥₩]\s*[\d,]+\.?\d*$', text):
+        return True
+    if re.match(r'^[\d,]+\.?\d*\s*[$€£¥₩円]$', text):
+        return True
+
+    return False
+
+
 def is_translatable_cell(cell: Cell) -> bool:
     """Check if a cell contains translatable text"""
     if cell.value is None:
@@ -220,6 +360,9 @@ def is_translatable_cell(cell: Cell) -> bool:
         return False
     # Skip cells that are formulas
     if str(cell.value).startswith("="):
+        return False
+    # Skip cells that don't need translation
+    if should_skip_text(cell.value):
         return False
     return True
 
@@ -340,22 +483,36 @@ def lambda_handler(event: dict, context: LambdaContext) -> dict:
 
         logger.info(f"Processing file: {s3_key}, {source_lang} -> {target_lang}, jobId: {job_id}")
 
+        # Determine file type
+        filename = os.path.basename(s3_key)
+        is_xls = is_xls_file(filename)
+
         # Create temp file paths
-        tmp_input = f"/tmp/input_{uuid.uuid4()}.xlsx"
-        tmp_output = f"/tmp/output_{uuid.uuid4()}.xlsx"
+        unique_id = uuid.uuid4()
+        if is_xls:
+            tmp_download = f"/tmp/input_{unique_id}.xls"
+            tmp_input = f"/tmp/input_{unique_id}_converted.xlsx"
+        else:
+            tmp_download = f"/tmp/input_{unique_id}.xlsx"
+            tmp_input = tmp_download
+        tmp_output = f"/tmp/output_{unique_id}.xlsx"
 
         # Download file from S3
-        s3_client.download_file(BUCKET_NAME, s3_key, tmp_input)
+        s3_client.download_file(BUCKET_NAME, s3_key, tmp_download)
         logger.info(f"Downloaded file from S3: {s3_key}")
+
+        # Convert .xls to .xlsx if necessary
+        if is_xls:
+            convert_xls_to_xlsx(tmp_download, tmp_input)
+            logger.info(f"Converted .xls to .xlsx for processing")
 
         # Translate the Excel file
         stats = translate_excel(tmp_input, tmp_output, source_lang, target_lang, job_id)
         logger.info(f"Translation complete: {stats}")
 
-        # Generate output S3 key
-        filename = os.path.basename(s3_key)
-        name, ext = os.path.splitext(filename)
-        output_filename = f"{name}_translated{ext}"
+        # Generate output S3 key (always output as .xlsx for compatibility)
+        name, _ = os.path.splitext(filename)
+        output_filename = f"{name}_translated.xlsx"
         output_s3_key = f"translated/{uuid.uuid4()}/{output_filename}"
 
         # Upload translated file to S3
@@ -363,8 +520,12 @@ def lambda_handler(event: dict, context: LambdaContext) -> dict:
         logger.info(f"Uploaded translated file to S3: {output_s3_key}")
 
         # Clean up temp files
-        os.remove(tmp_input)
-        os.remove(tmp_output)
+        if is_xls and os.path.exists(tmp_download):
+            os.remove(tmp_download)
+        if os.path.exists(tmp_input):
+            os.remove(tmp_input)
+        if os.path.exists(tmp_output):
+            os.remove(tmp_output)
 
         # Generate presigned URL for download
         presigned_url = s3_client.generate_presigned_url(
