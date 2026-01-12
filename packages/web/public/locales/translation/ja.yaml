@@ -391,6 +391,27 @@ drawer:
   generative_ai: (生成 AI)
   tools: ツール
   use_cases: ユースケース
+excelTranslate:
+  description: Excelファイルをアップロードすると、書式（フォント、罫線、色など）を保持したまま翻訳されます。
+  downloadButton: 翻訳済みファイルをダウンロード
+  error:
+    invalidFileType: xlsx または xls ファイルのみ対応しています
+    noFile: ファイルを選択してください
+    sameLanguage: 翻訳元と翻訳先の言語が同じです
+    title: エラー
+    translationFailed: 翻訳処理に失敗しました
+  fileLabel: Excelファイルを選択
+  resetButton: リセット
+  sourceLanguage: 翻訳元言語
+  success:
+    cellsTranslated: '{{translated}} / {{total}} セルを翻訳しました'
+    sheetsProcessed: '{{count}} シートを処理しました'
+    title: 翻訳完了
+  targetLanguage: 翻訳先言語
+  title: Excel 翻訳
+  translateButton: 翻訳を実行
+  translating: 翻訳中...
+  uploading: アップロード中...
 feedback:
   additional_feedback: 他にフィードバックがありましたら、入力してください。(任意)
   reason_error: 理由を選択してください。
@@ -741,6 +762,7 @@ navigation:
   agentChat: Agent チャット
   chat: チャット
   diagramGeneration: ダイアグラム生成
+  excelTranslate: Excel 翻訳
   flowChat: Flow チャット
   home: ホーム
   imageGeneration: 画像生成

@@ -1,3 +1,4 @@
+import * as path from 'path';
 import { Stack, Duration, RemovalPolicy } from 'aws-cdk-lib';
 import {
   AuthorizationType,
@@ -9,7 +10,12 @@ import {
   EndpointType,
 } from 'aws-cdk-lib/aws-apigateway';
 import { UserPool, UserPoolClient } from 'aws-cdk-lib/aws-cognito';
-import { IFunction } from 'aws-cdk-lib/aws-lambda';
+import {
+  IFunction,
+  DockerImageFunction,
+  DockerImageCode,
+  Architecture,
+} from 'aws-cdk-lib/aws-lambda';
 import { Construct } from 'constructs';
 import { NodejsFunction } from 'aws-cdk-lib/aws-lambda-nodejs';
 import { Table } from 'aws-cdk-lib/aws-dynamodb';
@@ -819,6 +825,36 @@ export class Api extends Construct {
     table.grantReadData(getTokenUsageFunction);
     props.statsTable.grantReadData(getTokenUsageFunction);
 
+    // Lambda function for Excel translation (preserves formatting)
+    const translateExcelFunction = new DockerImageFunction(
+      this,
+      'TranslateExcel',
+      {
+        code: DockerImageCode.fromImageAsset(
+          path.join(__dirname, '../../lambda-python/excel-translator')
+        ),
+        architecture: Architecture.X86_64,
+        timeout: Duration.minutes(15),
+        memorySize: 1024,
+        environment: {
+          BUCKET_NAME: fileBucket.bucketName,
+          MODEL_REGION: modelRegion,
+          MODEL_ID: modelIds.length > 0 ? modelIds[0].modelId : '',
+        },
+        vpc,
+        securityGroups,
+      }
+    );
+    fileBucket.grantReadWrite(translateExcelFunction);
+    // Grant Bedrock permissions
+    translateExcelFunction.role?.addToPrincipalPolicy(
+      new PolicyStatement({
+        effect: Effect.ALLOW,
+        resources: ['*'],
+        actions: ['bedrock:InvokeModel', 'bedrock:Converse'],
+      })
+    );
+
     // API Gateway
     const authorizer = new CognitoUserPoolsAuthorizer(this, 'Authorizer', {
       cognitoUserPools: [userPool],
@@ -1099,6 +1135,15 @@ export class Api extends Construct {
     tokenUsageResource.addMethod(
       'GET',
       new LambdaIntegration(getTokenUsageFunction),
+      commonAuthorizerProps
+    );
+
+    // POST: /excel/translate
+    const excelResource = api.root.addResource('excel');
+    const excelTranslateResource = excelResource.addResource('translate');
+    excelTranslateResource.addMethod(
+      'POST',
+      new LambdaIntegration(translateExcelFunction),
       commonAuthorizerProps
     );
 

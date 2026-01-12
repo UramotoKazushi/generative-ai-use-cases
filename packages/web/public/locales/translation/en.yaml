@@ -453,6 +453,27 @@ drawer:
   generative_ai: Generative AI
   tools: Tools
   use_cases: Use Cases
+excelTranslate:
+  description: Upload an Excel file to translate it while preserving formatting (fonts, borders, colors, etc.).
+  downloadButton: Download translated file
+  error:
+    invalidFileType: Only xlsx or xls files are supported
+    noFile: Please select a file
+    sameLanguage: Source and target languages are the same
+    title: Error
+    translationFailed: Translation failed
+  fileLabel: Select Excel file
+  resetButton: Reset
+  sourceLanguage: Source language
+  success:
+    cellsTranslated: '{{translated}} / {{total}} cells translated'
+    sheetsProcessed: '{{count}} sheets processed'
+    title: Translation Complete
+  targetLanguage: Target language
+  title: Excel Translation
+  translateButton: Translate
+  translating: Translating...
+  uploading: Uploading...
 feedback:
   additional_feedback: If you have any additional feedback, please enter it here. (optional)
   reason_error: Please select a reason.
@@ -895,6 +916,7 @@ navigation:
   agentChat: Agent Chat
   chat: Chat
   diagramGeneration: Diagram Generation
+  excelTranslate: Excel Translation
   flowChat: Flow Chat
   home: Home
   imageGeneration: Image Generation

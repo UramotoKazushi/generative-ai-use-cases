@@ -23,6 +23,7 @@ import {
   PiTreeStructure,
   PiNotebook,
   PiGraph,
+  PiFileXls,
 } from 'react-icons/pi';
 import { Outlet } from 'react-router-dom';
 import Drawer, { ItemProps } from './components/Drawer';
@@ -213,6 +214,14 @@ const App: React.FC = () => {
           label: t('navigation.translation'),
           to: '/translate',
           icon: <PiTranslate />,
+          display: 'usecase' as const,
+        }
+      : null,
+    enabled('excelTranslate')
+      ? {
+          label: t('navigation.excelTranslate'),
+          to: '/excel-translate',
+          icon: <PiFileXls />,
           display: 'usecase' as const,
         }
       : null,

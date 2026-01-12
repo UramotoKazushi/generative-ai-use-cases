@@ -17,6 +17,7 @@ import SharedChatPage from './pages/SharedChatPage';
 import SummarizePage from './pages/SummarizePage';
 import GenerateTextPage from './pages/GenerateTextPage';
 import TranslatePage from './pages/TranslatePage';
+import ExcelTranslatePage from './pages/ExcelTranslatePage';
 import VideoAnalyzerPage from './pages/VideoAnalyzerPage';
 import NotFound from './pages/NotFound';
 import RagPage from './pages/RagPage';
@@ -125,6 +126,12 @@ const routes: RouteObject[] = [
     ? {
         path: '/translate',
         element: <TranslatePage />,
+      }
+    : null,
+  enabled('excelTranslate')
+    ? {
+        path: '/excel-translate',
+        element: <ExcelTranslatePage />,
       }
     : null,
   enabled('webContent')
