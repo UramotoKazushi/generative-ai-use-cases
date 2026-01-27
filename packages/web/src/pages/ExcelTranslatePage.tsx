@@ -22,7 +22,14 @@ const LANGUAGES = [
 ];
 /* eslint-enable i18nhelper/no-jp-string */
 
-type JobStatus = 'PENDING' | 'PROCESSING' | 'COMPLETED' | 'FAILED';
+type JobStatus =
+  | 'PENDING'
+  | 'PREPARING'
+  | 'TRANSLATING'
+  | 'MERGING'
+  | 'PROCESSING'
+  | 'COMPLETED'
+  | 'FAILED';
 
 type ProgressInfo = {
   current_sheet?: string;
@@ -32,6 +39,12 @@ type ProgressInfo = {
   total_translatable?: number;
   percent?: number;
   batch_progress?: string;
+  phase?: string;
+  batch_count?: number;
+  completed_batches?: number;
+  total_batches?: number;
+  elapsed_seconds?: number;
+  estimated_remaining_seconds?: number;
 };
 
 type JobStatusResponse = {
@@ -45,8 +58,11 @@ type JobStatusResponse = {
   outputS3Key?: string;
   stats?: {
     total_cells: number;
+    translatable_cells: number;
     translated_cells: number;
     sheets_processed: number;
+    unique_texts: number;
+    batch_count: number;
   };
   progress?: ProgressInfo;
   error?: string;
@@ -59,6 +75,25 @@ type StartJobResponse = {
 };
 
 const POLLING_INTERVAL = 3000; // 3 seconds
+
+// Helper function to format seconds into human-readable time
+const formatTime = (seconds: number): string => {
+  if (seconds < 60) {
+    return `${seconds}秒`;
+  }
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  if (minutes < 60) {
+    return remainingSeconds > 0
+      ? `${minutes}分${remainingSeconds}秒`
+      : `${minutes}分`;
+  }
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return remainingMinutes > 0
+    ? `${hours}時間${remainingMinutes}分`
+    : `${hours}時間`;
+};
 
 const ExcelTranslatePage: React.FC = () => {
   const { t } = useTranslation();
@@ -256,6 +291,12 @@ const ExcelTranslatePage: React.FC = () => {
     switch (jobStatus) {
       case 'PENDING':
         return t('excelTranslate.status.pending');
+      case 'PREPARING':
+        return t('excelTranslate.status.preparing');
+      case 'TRANSLATING':
+        return t('excelTranslate.status.translating');
+      case 'MERGING':
+        return t('excelTranslate.status.merging');
       case 'PROCESSING':
         return t('excelTranslate.status.processing');
       default:
@@ -357,11 +398,13 @@ const ExcelTranslatePage: React.FC = () => {
                 <div className="mt-4">
                   <div className="mb-2 flex justify-between text-sm text-blue-700">
                     <span>
-                      {progress.current_sheet
-                        ? t('excelTranslate.progress.currentSheet', {
-                            sheet: progress.current_sheet,
-                          })
-                        : t('excelTranslate.progress.processing')}
+                      {progress.phase === 'prepared'
+                        ? t('excelTranslate.progress.prepared')
+                        : progress.phase === 'translating'
+                          ? t('excelTranslate.progress.translating')
+                          : progress.phase === 'merging'
+                            ? t('excelTranslate.progress.merging')
+                            : t('excelTranslate.progress.processing')}
                     </span>
                     {/* eslint-disable-next-line @shopify/jsx-no-hardcoded-content */}
                     <span>{progress.percent}%</span>
@@ -373,21 +416,36 @@ const ExcelTranslatePage: React.FC = () => {
                     />
                   </div>
                   <div className="mt-2 flex flex-wrap gap-4 text-xs text-blue-600">
-                    {progress.translated_cells !== undefined &&
-                      progress.total_translatable !== undefined && (
+                    {progress.batch_progress && (
+                      <span>
+                        {t('excelTranslate.progress.batches', {
+                          progress: progress.batch_progress,
+                        })}
+                      </span>
+                    )}
+                    {progress.total_translatable !== undefined &&
+                      progress.batch_count !== undefined && (
                         <span>
-                          {t('excelTranslate.progress.cells', {
-                            translated: progress.translated_cells,
-                            total: progress.total_translatable,
+                          {t('excelTranslate.progress.textsAndBatches', {
+                            texts: progress.total_translatable,
+                            batches: progress.batch_count,
                           })}
                         </span>
                       )}
-                    {progress.sheets_processed !== undefined &&
-                      progress.total_sheets !== undefined && (
-                        <span>
-                          {t('excelTranslate.progress.sheets', {
-                            processed: progress.sheets_processed,
-                            total: progress.total_sheets,
+                    {progress.elapsed_seconds !== undefined && (
+                      <span>
+                        {t('excelTranslate.progress.elapsed', {
+                          time: formatTime(progress.elapsed_seconds),
+                        })}
+                      </span>
+                    )}
+                    {progress.estimated_remaining_seconds !== undefined &&
+                      progress.estimated_remaining_seconds > 0 && (
+                        <span className="font-medium">
+                          {t('excelTranslate.progress.remaining', {
+                            time: formatTime(
+                              progress.estimated_remaining_seconds
+                            ),
                           })}
                         </span>
                       )}
@@ -434,7 +492,7 @@ const ExcelTranslatePage: React.FC = () => {
                     <p>
                       {t('excelTranslate.success.cellsTranslated', {
                         translated: result.stats.translated_cells,
-                        total: result.stats.total_cells,
+                        total: result.stats.translatable_cells,
                       })}
                     </p>
                   </>

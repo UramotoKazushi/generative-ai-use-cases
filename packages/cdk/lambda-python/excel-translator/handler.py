@@ -114,103 +114,67 @@ def update_job_status(job_id: str, status: str, **kwargs) -> None:
         logger.warning(f"Failed to update job status: {e}")
 
 
-def translate_text_with_retry(text: str, source_lang: str, target_lang: str, max_retries: int = 5) -> str:
-    """Translate text using Amazon Bedrock with exponential backoff and caching"""
-    if not text or not text.strip():
-        return text
-
-    # Check cache first
-    cache_key = f"{source_lang}:{target_lang}:{text}"
-    if cache_key in translation_cache:
-        logger.debug(f"Cache hit for text: {text[:30]}...")
-        return translation_cache[cache_key]
-
-    prompt = f"""Translate the following {source_lang} text to {target_lang}.
-Rules:
-- Only output the translation, nothing else
-- Preserve any numbers, special characters, and formatting
-- If the text contains only numbers or symbols, return it as-is
-- Keep line breaks if present
-
-Text to translate:
-{text}"""
-
-    for attempt in range(max_retries):
-        try:
-            response = bedrock_client.converse(
-                modelId=MODEL_ID,
-                messages=[{"role": "user", "content": [{"text": prompt}]}],
-                inferenceConfig={"maxTokens": 4096, "temperature": 0.1},
-            )
-            translated = response["output"]["message"]["content"][0]["text"].strip()
-            # Store in cache
-            translation_cache[cache_key] = translated
-            return translated
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "ThrottlingException":
-                if attempt < max_retries - 1:
-                    # Exponential backoff: 2, 4, 8, 16, 32 seconds
-                    wait_time = (2 ** (attempt + 1)) + (time.time() % 1)  # Add jitter
-                    logger.info(f"Throttled, waiting {wait_time:.1f}s before retry {attempt + 2}/{max_retries}")
-                    time.sleep(wait_time)
-                    continue
-            logger.warning(f"Translation failed for text: {text[:50]}... Error: {e}")
-            return text
-        except Exception as e:
-            logger.warning(f"Translation failed for text: {text[:50]}... Error: {e}")
-            return text
-
-    return text  # Return original text if all retries fail
-
-
-def batch_translate_texts(texts: list[tuple[str, Any]], source_lang: str, target_lang: str, job_id: str = None, base_translated: int = 0, total_translatable: int = 0) -> dict[Any, str]:
+def bulk_translate_unique_texts(
+    unique_texts: list[str],
+    source_lang: str,
+    target_lang: str,
+    job_id: str = None,
+    total_cells: int = 0,
+) -> dict[str, str]:
     """
-    Batch translate multiple texts efficiently with caching.
-    Returns a dict mapping original cell references to translated text.
-    """
-    # Filter out empty texts and non-string values
-    translatable = [(ref, text) for ref, text in texts if text and isinstance(text, str) and text.strip()]
+    Translate unique texts in large batches using JSON format.
+    Returns a dict mapping original text to translated text.
 
-    if not translatable:
+    This is much more efficient than translating cell by cell:
+    - 687 cells with 200 unique texts = 2-3 API calls instead of 28
+    """
+    if not unique_texts:
         return {}
 
     translations = {}
     texts_to_translate = []
 
-    # Check cache first and separate cached vs uncached texts
-    for ref, text in translatable:
+    # Check cache first
+    for text in unique_texts:
         cache_key = f"{source_lang}:{target_lang}:{text}"
         if cache_key in translation_cache:
-            translations[ref] = translation_cache[cache_key]
+            translations[text] = translation_cache[cache_key]
         else:
-            texts_to_translate.append((ref, text))
+            texts_to_translate.append(text)
 
-    cache_hits = len(translations)
-    if cache_hits > 0:
-        logger.info(f"Cache hits: {cache_hits}/{len(translatable)} texts")
+    if translations:
+        logger.info(f"Cache hits: {len(translations)}/{len(unique_texts)} unique texts")
 
     if not texts_to_translate:
         return translations
 
-    # Smaller batch size to avoid throttling
-    BATCH_SIZE = 10
+    # Large batch size for efficiency - Claude can handle 100+ texts easily
+    BATCH_SIZE = 100
     max_retries = 5
+    total_batches = (len(texts_to_translate) + BATCH_SIZE - 1) // BATCH_SIZE
 
-    for i in range(0, len(texts_to_translate), BATCH_SIZE):
-        batch = texts_to_translate[i : i + BATCH_SIZE]
+    logger.info(f"Translating {len(texts_to_translate)} unique texts in {total_batches} batches")
 
-        # Create a numbered list for batch translation
-        numbered_texts = "\n".join([f"[{idx}] {text}" for idx, (ref, text) in enumerate(batch)])
+    for batch_idx in range(0, len(texts_to_translate), BATCH_SIZE):
+        batch = texts_to_translate[batch_idx : batch_idx + BATCH_SIZE]
+        batch_num = batch_idx // BATCH_SIZE + 1
+
+        # Create JSON input for structured translation
+        input_data = [{"id": i, "text": text} for i, text in enumerate(batch)]
 
         prompt = f"""Translate the following {source_lang} texts to {target_lang}.
-Each text is prefixed with a number in brackets like [0], [1], etc.
-Return translations in the same format, preserving the numbers.
-Only output the translations, nothing else.
-Preserve any numbers, special characters, and formatting within each text.
-If a text contains only numbers or symbols, return it as-is.
 
-Texts to translate:
-{numbered_texts}"""
+IMPORTANT RULES:
+- Return ONLY a valid JSON array with translations
+- Each item must have "id" (same as input) and "translation" fields
+- Preserve numbers, special characters, and formatting
+- If text contains only numbers/symbols, return as-is
+
+Input:
+{json.dumps(input_data, ensure_ascii=False)}
+
+Output format (JSON array only, no other text):
+[{{"id": 0, "translation": "..."}}, {{"id": 1, "translation": "..."}}, ...]"""
 
         success = False
         for attempt in range(max_retries):
@@ -218,40 +182,56 @@ Texts to translate:
                 response = bedrock_client.converse(
                     modelId=MODEL_ID,
                     messages=[{"role": "user", "content": [{"text": prompt}]}],
-                    inferenceConfig={"maxTokens": 8192, "temperature": 0.1},
+                    inferenceConfig={"maxTokens": 16384, "temperature": 0.1},
                 )
                 result = response["output"]["message"]["content"][0]["text"].strip()
 
-                # Parse the results
-                for line in result.split("\n"):
-                    line = line.strip()
-                    if line.startswith("[") and "]" in line:
-                        try:
-                            bracket_end = line.index("]")
-                            idx = int(line[1:bracket_end])
-                            translated = line[bracket_end + 1 :].strip()
-                            if 0 <= idx < len(batch):
-                                ref, original_text = batch[idx]
-                                translations[ref] = translated
-                                # Store in cache
-                                cache_key = f"{source_lang}:{target_lang}:{original_text}"
-                                translation_cache[cache_key] = translated
-                        except (ValueError, IndexError):
-                            continue
+                # Parse JSON response
+                # Handle potential markdown code blocks
+                if result.startswith("```"):
+                    result = result.split("```")[1]
+                    if result.startswith("json"):
+                        result = result[4:]
+                    result = result.strip()
 
-                # Fill in any missing translations with individual calls
-                for idx, (ref, text) in enumerate(batch):
-                    if ref not in translations:
-                        translations[ref] = translate_text_with_retry(text, source_lang, target_lang)
+                try:
+                    parsed = json.loads(result)
+                    for item in parsed:
+                        idx = item.get("id")
+                        translated = item.get("translation", "")
+                        if idx is not None and 0 <= idx < len(batch):
+                            original_text = batch[idx]
+                            translations[original_text] = translated
+                            # Store in cache
+                            cache_key = f"{source_lang}:{target_lang}:{original_text}"
+                            translation_cache[cache_key] = translated
+                except json.JSONDecodeError:
+                    # Fallback: try to parse line by line if JSON fails
+                    logger.warning("JSON parse failed, attempting line-by-line parse")
+                    for line in result.split("\n"):
+                        line = line.strip()
+                        if '"id"' in line and '"translation"' in line:
+                            try:
+                                item = json.loads(line.rstrip(","))
+                                idx = item.get("id")
+                                translated = item.get("translation", "")
+                                if idx is not None and 0 <= idx < len(batch):
+                                    original_text = batch[idx]
+                                    translations[original_text] = translated
+                                    cache_key = f"{source_lang}:{target_lang}:{original_text}"
+                                    translation_cache[cache_key] = translated
+                            except:
+                                continue
 
                 success = True
+                logger.info(f"Translated batch {batch_num}/{total_batches} ({len(batch)} texts)")
                 break
 
             except ClientError as e:
                 if e.response["Error"]["Code"] == "ThrottlingException":
                     if attempt < max_retries - 1:
                         wait_time = (2 ** (attempt + 1)) + (time.time() % 1)
-                        logger.info(f"Batch throttled, waiting {wait_time:.1f}s before retry {attempt + 2}/{max_retries}")
+                        logger.info(f"Throttled, waiting {wait_time:.1f}s before retry {attempt + 2}/{max_retries}")
                         time.sleep(wait_time)
                         continue
                 logger.warning(f"Batch translation failed: {e}")
@@ -260,45 +240,75 @@ Texts to translate:
                 logger.warning(f"Batch translation failed: {e}")
                 break
 
-        # Fallback to individual translations if batch failed
-        if not success:
-            logger.info(f"Falling back to individual translations for batch {i // BATCH_SIZE + 1}")
-            for ref, text in batch:
-                if ref not in translations:
-                    translations[ref] = translate_text_with_retry(text, source_lang, target_lang)
-                    # Small delay between individual calls
-                    time.sleep(0.5)
+        # Fallback for any missing translations in this batch
+        if not success or any(text not in translations for text in batch):
+            missing = [t for t in batch if t not in translations]
+            if missing:
+                logger.info(f"Retrying {len(missing)} missing translations individually")
+                for text in missing:
+                    translated = translate_single_text(text, source_lang, target_lang)
+                    translations[text] = translated
 
-        # Add delay between batches to avoid throttling
-        if i + BATCH_SIZE < len(translatable):
-            time.sleep(1.0)
-
-        # Log progress
-        batch_num = i // BATCH_SIZE + 1
-        total_batches = (len(translatable) + BATCH_SIZE - 1) // BATCH_SIZE
-        logger.info(f"Translated batch {batch_num}/{total_batches}")
-
-        # Update progress in DynamoDB
-        if job_id and total_translatable > 0:
-            current_translated = base_translated + len(translations)
+        # Update progress
+        if job_id and total_cells > 0:
+            translated_count = len(translations)
             update_job_status(
                 job_id,
                 "PROCESSING",
                 progress=json.dumps({
-                    "translated_cells": current_translated,
-                    "total_translatable": total_translatable,
-                    "percent": int(current_translated / total_translatable * 100),
+                    "phase": "translating_unique_texts",
+                    "unique_translated": translated_count,
+                    "unique_total": len(unique_texts),
                     "batch_progress": f"{batch_num}/{total_batches}",
+                    "percent": int(translated_count / len(unique_texts) * 100),
                 }),
             )
 
+        # Small delay between batches to avoid throttling
+        if batch_idx + BATCH_SIZE < len(texts_to_translate):
+            time.sleep(0.5)
+
     return translations
+
+
+def translate_single_text(text: str, source_lang: str, target_lang: str, max_retries: int = 3) -> str:
+    """Translate a single text as fallback"""
+    if not text or not text.strip():
+        return text
+
+    cache_key = f"{source_lang}:{target_lang}:{text}"
+    if cache_key in translation_cache:
+        return translation_cache[cache_key]
+
+    prompt = f"""Translate to {target_lang}. Output only the translation:
+{text}"""
+
+    for attempt in range(max_retries):
+        try:
+            response = bedrock_client.converse(
+                modelId=MODEL_ID,
+                messages=[{"role": "user", "content": [{"text": prompt}]}],
+                inferenceConfig={"maxTokens": 1024, "temperature": 0.1},
+            )
+            translated = response["output"]["message"]["content"][0]["text"].strip()
+            translation_cache[cache_key] = translated
+            return translated
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ThrottlingException" and attempt < max_retries - 1:
+                time.sleep(2 ** (attempt + 1))
+                continue
+            return text
+        except:
+            return text
+
+    return text
 
 
 def should_skip_text(text: str) -> bool:
     """
     Check if text should be skipped from translation.
     Returns True if the text doesn't need translation.
+    Enhanced filtering to reduce unnecessary API calls.
     """
     text = text.strip()
 
@@ -306,8 +316,8 @@ def should_skip_text(text: str) -> bool:
     if not text:
         return True
 
-    # Numbers only (including decimals, negatives, percentages)
-    if re.match(r'^-?[\d,]+\.?\d*%?$', text):
+    # Numbers only (including decimals, negatives, percentages, with spaces)
+    if re.match(r'^-?[\d,\s]+\.?\d*%?$', text):
         return True
 
     # Date patterns (various formats)
@@ -337,14 +347,33 @@ def should_skip_text(text: str) -> bool:
     if re.match(r'^[\d\s\-\+\(\)]+$', text) and len(re.sub(r'\D', '', text)) >= 7:
         return True
 
-    # Single characters or symbols only
-    if len(text) <= 2 and not any(c.isalpha() for c in text):
+    # Symbols and punctuation only (no letters)
+    if not any(c.isalpha() for c in text):
         return True
 
     # Currency values
     if re.match(r'^[$€£¥₩]\s*[\d,]+\.?\d*$', text):
         return True
     if re.match(r'^[\d,]+\.?\d*\s*[$€£¥₩円]$', text):
+        return True
+
+    # English/ASCII only text (no need to translate if already in target language or code/identifiers)
+    # Skip if text contains only ASCII letters, numbers, and common punctuation
+    if re.match(r'^[A-Za-z0-9\s\.,;:!?\'"()\-_@#$%&*+=/<>\\|{}\[\]`~]+$', text):
+        # But don't skip if it's a meaningful English sentence (has spaces and multiple words)
+        words = text.split()
+        if len(words) <= 2:
+            # Short English text like "OK", "Yes", "ID", "No." - skip
+            return True
+        # Longer English text might need translation depending on context
+        # Skip common technical terms and identifiers
+        if re.match(r'^[A-Z][A-Za-z0-9_]+$', text):  # CamelCase identifiers
+            return True
+        if re.match(r'^[a-z_][a-z0-9_]*$', text):  # snake_case identifiers
+            return True
+
+    # File paths and technical identifiers
+    if re.match(r'^[A-Za-z]:\\', text) or text.startswith('/'):
         return True
 
     return False
@@ -371,65 +400,109 @@ def translate_excel(input_path: str, output_path: str, source_lang: str, target_
     """
     Translate an Excel file while preserving all formatting.
 
-    Returns statistics about the translation.
+    Uses unique text aggregation for efficiency:
+    - Extract unique texts from ALL sheets
+    - Translate unique texts in large batches (100 per API call)
+    - Apply translations back to all cells
+
+    This reduces API calls dramatically (e.g., 687 cells with 200 unique texts = 2-3 API calls)
     """
     # Load workbook preserving all formatting
     wb = load_workbook(input_path)
 
     stats = {"total_cells": 0, "translated_cells": 0, "sheets_processed": 0, "total_sheets": len(wb.worksheets)}
 
-    # First pass: count total translatable cells
-    total_translatable = 0
+    # Phase 1: Collect ALL translatable cells and their texts from ALL sheets
+    logger.info("Phase 1: Collecting texts from all sheets...")
+    all_cells_info: list[tuple[str, str, str]] = []  # (sheet_name, coord, text)
+    unique_texts: set[str] = set()
+    total_cell_count = 0
+
     for sheet in wb.worksheets:
         for row in sheet.iter_rows():
             for cell in row:
-                stats["total_cells"] += 1
+                total_cell_count += 1
                 if is_translatable_cell(cell):
-                    total_translatable += 1
+                    text = cell.value
+                    all_cells_info.append((sheet.title, cell.coordinate, text))
+                    unique_texts.add(text)
 
-    stats["total_translatable"] = total_translatable
+    stats["total_cells"] = total_cell_count
+    stats["total_translatable"] = len(all_cells_info)
+    stats["unique_texts"] = len(unique_texts)
+
+    logger.info(f"Found {len(all_cells_info)} translatable cells with {len(unique_texts)} unique texts")
+
+    if job_id:
+        update_job_status(
+            job_id,
+            "PROCESSING",
+            progress=json.dumps({
+                "phase": "collecting_texts",
+                "total_translatable": len(all_cells_info),
+                "unique_texts": len(unique_texts),
+                "percent": 5,
+            }),
+        )
+
+    if not unique_texts:
+        logger.info("No translatable text found")
+        wb.save(output_path)
+        return stats
+
+    # Phase 2: Translate all unique texts at once
+    logger.info("Phase 2: Translating unique texts in batches...")
+    if job_id:
+        update_job_status(
+            job_id,
+            "PROCESSING",
+            progress=json.dumps({
+                "phase": "translating",
+                "unique_texts": len(unique_texts),
+                "percent": 10,
+            }),
+        )
+
+    translations = bulk_translate_unique_texts(
+        list(unique_texts),
+        source_lang,
+        target_lang,
+        job_id,
+        len(all_cells_info),
+    )
+
+    logger.info(f"Translated {len(translations)} unique texts")
+
+    # Phase 3: Apply translations back to all cells
+    logger.info("Phase 3: Applying translations to cells...")
+    if job_id:
+        update_job_status(
+            job_id,
+            "PROCESSING",
+            progress=json.dumps({
+                "phase": "applying_translations",
+                "percent": 90,
+            }),
+        )
+
     translated_count = 0
+    for sheet_name, coord, original_text in all_cells_info:
+        sheet = wb[sheet_name]
+        if original_text in translations:
+            sheet[coord].value = translations[original_text]
+            translated_count += 1
+        else:
+            # Fallback: translate individually if not in cache
+            translated = translate_single_text(original_text, source_lang, target_lang)
+            sheet[coord].value = translated
+            translated_count += 1
 
-    for sheet_idx, sheet in enumerate(wb.worksheets):
-        stats["sheets_processed"] = sheet_idx + 1
-        stats["current_sheet"] = sheet.title
-
-        # Update progress
-        if job_id:
-            update_job_status(
-                job_id,
-                "PROCESSING",
-                progress=json.dumps({
-                    "current_sheet": sheet.title,
-                    "sheets_processed": sheet_idx + 1,
-                    "total_sheets": len(wb.worksheets),
-                    "translated_cells": translated_count,
-                    "total_translatable": total_translatable,
-                    "percent": int((translated_count / total_translatable * 100) if total_translatable > 0 else 0),
-                }),
-            )
-
-        # Collect all cells that need translation
-        cells_to_translate: list[tuple[str, str]] = []
-
-        for row in sheet.iter_rows():
-            for cell in row:
-                if is_translatable_cell(cell):
-                    # Use coordinate as reference
-                    cells_to_translate.append((cell.coordinate, cell.value))
-
-        # Batch translate all cells
-        if cells_to_translate:
-            translations = batch_translate_texts(cells_to_translate, source_lang, target_lang, job_id, translated_count, total_translatable)
-
-            # Apply translations back to cells
-            for coord, translated in translations.items():
-                sheet[coord].value = translated
-                translated_count += 1
-                stats["translated_cells"] = translated_count
+    stats["translated_cells"] = translated_count
+    stats["sheets_processed"] = len(wb.worksheets)
 
     # Save the translated workbook
     wb.save(output_path)
+    logger.info(f"Saved translated workbook with {translated_count} translated cells")
 
     return stats
 

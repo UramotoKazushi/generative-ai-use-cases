@@ -11,8 +11,11 @@ COPY pyproject.toml ./
 # Install dependencies
 RUN uv pip install --system -r pyproject.toml
 
-# Copy application code
+# Copy all handler files
 COPY handler.py ./
+COPY prepare_handler.py ./
+COPY translate_batch_handler.py ./
+COPY merge_handler.py ./
 
-# Set the handler
+# Default handler (can be overridden by CMD in CDK)
 CMD ["handler.lambda_handler"]

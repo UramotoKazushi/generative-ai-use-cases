@@ -464,16 +464,26 @@ excelTranslate:
     translationFailed: Translation failed
   fileLabel: Select Excel file
   progress:
+    batches: 'Batch progress: {{progress}}'
     cells: 'Translated: {{translated}} / {{total}} cells'
     currentSheet: 'Processing sheet "{{sheet}}"'
+    elapsed: 'Elapsed: {{time}}'
+    merging: Merging translation results...
+    prepared: Text extraction complete, starting translation
     processing: Processing...
+    remaining: 'Est. remaining: {{time}}'
     sheets: 'Sheets: {{processed}} / {{total}}'
+    textsAndBatches: 'Unique texts: {{texts}} / {{batches}} batches'
+    translating: Translating batches...
   resetButton: Reset
   sourceLanguage: Source language
   status:
     asyncNote: Large files may take several minutes to process. Please keep this page open.
+    merging: Merging results...
     pending: Starting job...
+    preparing: Analyzing file...
     processing: Processing translation...
+    translating: Translating...
   success:
     cellsTranslated: '{{translated}} / {{total}} cells translated'
     sheetsProcessed: '{{count}} sheets processed'

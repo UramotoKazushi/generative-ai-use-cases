@@ -46,6 +46,8 @@ import {
   IVpc,
   ISecurityGroup,
 } from 'aws-cdk-lib/aws-ec2';
+import * as sfn from 'aws-cdk-lib/aws-stepfunctions';
+import * as tasks from 'aws-cdk-lib/aws-stepfunctions-tasks';
 
 export interface BackendApiProps {
   // Context Params
@@ -826,19 +828,44 @@ export class Api extends Construct {
     table.grantReadData(getTokenUsageFunction);
     props.statsTable.grantReadData(getTokenUsageFunction);
 
-    // Lambda function for Excel translation (async processing with DynamoDB)
+    // Excel translation with Step Functions for parallel processing
     const excelTranslationJobTable = props.excelTranslationJobTable;
 
-    const translateExcelFunction = new DockerImageFunction(
+    // Prepare Lambda: Extracts texts, creates batches
+    const excelPrepareFunction = new DockerImageFunction(
       this,
-      'TranslateExcel',
+      'ExcelTranslatePrepare',
       {
         code: DockerImageCode.fromImageAsset(
-          path.join(__dirname, '../../lambda-python/excel-translator')
+          path.join(__dirname, '../../lambda-python/excel-translator'),
+          { cmd: ['prepare_handler.lambda_handler'] }
         ),
         architecture: Architecture.X86_64,
-        timeout: Duration.minutes(15),
+        timeout: Duration.minutes(5),
         memorySize: 1024,
+        environment: {
+          BUCKET_NAME: fileBucket.bucketName,
+          JOB_TABLE_NAME: excelTranslationJobTable.tableName,
+        },
+        vpc,
+        securityGroups,
+      }
+    );
+    fileBucket.grantReadWrite(excelPrepareFunction);
+    excelTranslationJobTable.grantReadWriteData(excelPrepareFunction);
+
+    // Translate Batch Lambda: Translates one batch
+    const excelTranslateBatchFunction = new DockerImageFunction(
+      this,
+      'ExcelTranslateBatch',
+      {
+        code: DockerImageCode.fromImageAsset(
+          path.join(__dirname, '../../lambda-python/excel-translator'),
+          { cmd: ['translate_batch_handler.lambda_handler'] }
+        ),
+        architecture: Architecture.X86_64,
+        timeout: Duration.minutes(10),
+        memorySize: 512,
         environment: {
           BUCKET_NAME: fileBucket.bucketName,
           MODEL_REGION: modelRegion,
@@ -849,15 +876,85 @@ export class Api extends Construct {
         securityGroups,
       }
     );
-    fileBucket.grantReadWrite(translateExcelFunction);
-    excelTranslationJobTable.grantReadWriteData(translateExcelFunction);
-    // Grant Bedrock permissions
-    translateExcelFunction.role?.addToPrincipalPolicy(
+    fileBucket.grantReadWrite(excelTranslateBatchFunction);
+    excelTranslationJobTable.grantReadWriteData(excelTranslateBatchFunction);
+    excelTranslateBatchFunction.role?.addToPrincipalPolicy(
       new PolicyStatement({
         effect: Effect.ALLOW,
         resources: ['*'],
         actions: ['bedrock:InvokeModel', 'bedrock:Converse'],
       })
+    );
+
+    // Merge Lambda: Combines translations, creates final Excel
+    const excelMergeFunction = new DockerImageFunction(
+      this,
+      'ExcelTranslateMerge',
+      {
+        code: DockerImageCode.fromImageAsset(
+          path.join(__dirname, '../../lambda-python/excel-translator'),
+          { cmd: ['merge_handler.lambda_handler'] }
+        ),
+        architecture: Architecture.X86_64,
+        timeout: Duration.minutes(5),
+        memorySize: 1024,
+        environment: {
+          BUCKET_NAME: fileBucket.bucketName,
+          JOB_TABLE_NAME: excelTranslationJobTable.tableName,
+        },
+        vpc,
+        securityGroups,
+      }
+    );
+    fileBucket.grantReadWrite(excelMergeFunction);
+    excelTranslationJobTable.grantReadWriteData(excelMergeFunction);
+
+    // Step Functions State Machine for Excel Translation
+    const prepareTask = new tasks.LambdaInvoke(this, 'PrepareTranslation', {
+      lambdaFunction: excelPrepareFunction,
+      outputPath: '$.Payload',
+    });
+
+    const translateBatchTask = new tasks.LambdaInvoke(
+      this,
+      'TranslateBatch',
+      {
+        lambdaFunction: excelTranslateBatchFunction,
+        outputPath: '$.Payload',
+      }
+    );
+
+    const mapState = new sfn.Map(this, 'TranslateBatches', {
+      maxConcurrency: 5,
+      itemsPath: '$.batches',
+      itemSelector: {
+        'batchId.$': '$$.Map.Item.Value.batchId',
+        'batchKey.$': '$$.Map.Item.Value.batchKey',
+        'textCount.$': '$$.Map.Item.Value.textCount',
+        'jobId.$': '$.jobId',
+        'sourceLanguage.$': '$.sourceLanguage',
+        'targetLanguage.$': '$.targetLanguage',
+        'totalBatches.$': '$.totalBatches',
+        'startTime.$': '$.startTime',
+      },
+      resultPath: '$.translationResults',
+    });
+    mapState.itemProcessor(translateBatchTask);
+
+    const mergeTask = new tasks.LambdaInvoke(this, 'MergeTranslations', {
+      lambdaFunction: excelMergeFunction,
+      outputPath: '$.Payload',
+    });
+
+    const definition = prepareTask.next(mapState).next(mergeTask);
+
+    const excelTranslationStateMachine = new sfn.StateMachine(
+      this,
+      'ExcelTranslationStateMachine',
+      {
+        definitionBody: sfn.DefinitionBody.fromChainable(definition),
+        timeout: Duration.hours(1),
+      }
     );
 
     // Lambda function to start Excel translation job (returns immediately)
@@ -870,14 +967,16 @@ export class Api extends Construct {
         timeout: Duration.seconds(30),
         environment: {
           JOB_TABLE_NAME: excelTranslationJobTable.tableName,
-          TRANSLATE_FUNCTION_NAME: translateExcelFunction.functionName,
+          STATE_MACHINE_ARN: excelTranslationStateMachine.stateMachineArn,
         },
         vpc,
         securityGroups,
       }
     );
     excelTranslationJobTable.grantReadWriteData(startExcelTranslationFunction);
-    translateExcelFunction.grantInvoke(startExcelTranslationFunction);
+    excelTranslationStateMachine.grantStartExecution(
+      startExcelTranslationFunction
+    );
 
     // Lambda function to get Excel translation job status
     const getExcelTranslationStatusFunction = new NodejsFunction(
